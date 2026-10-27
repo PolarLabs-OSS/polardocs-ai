@@ -8,7 +8,7 @@ def scoped(root,name):
     return p
 def tools(app):
     return ["list_files","read_text","finish"]+{
-      "polarwriter":["save_text"],"polardocs-ai":["search_text","save_text"],
+      "polarwriter":["save_text"],"polardocs-ai":["search_text","read_pdf","read_docx","save_text"],
       "polarfiles-ai":["move_file"],"polardata-ai":["csv_summary","save_text"],
       "polarcode-ai":["replace_text"],"polarmail-ai":["save_text"],"polartasks-ai":["save_text"]}[app]
 def run_tool(tool,args,folder,approve):
@@ -22,6 +22,23 @@ def run_tool(tool,args,folder,approve):
             q=str(args.get("query","")).lower()
             return "\n".join(str(i+1)+": "+line[:200] for i,line in enumerate(value.splitlines()) if q in line.lower())[:15000]
         return value
+    if tool=="read_pdf":
+        if path.stat().st_size>10000000:raise ValueError("PDF oltre 10 MB")
+        from pypdf import PdfReader
+        reader=PdfReader(str(path))
+        texts=[]
+        for i,page in enumerate(reader.pages[:30]):
+            texts.append("[Pagina "+str(i+1)+"]\n"+(page.extract_text() or ""))
+        return "\n".join(texts)[:50000]
+    if tool=="read_docx":
+        if path.stat().st_size>10000000:raise ValueError("DOCX oltre 10 MB")
+        from zipfile import ZipFile
+        import xml.etree.ElementTree as ET
+        with ZipFile(path) as archive:
+            xml=archive.read("word/document.xml")
+        ns={"w":"http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        tree=ET.fromstring(xml)
+        return "\n".join("".join(n.text or "" for n in para.findall(".//w:t",ns)) for para in tree.findall(".//w:p",ns))[:50000]
     if tool=="csv_summary":
         if path.stat().st_size>200000:raise ValueError("CSV troppo grande")
         with path.open(encoding="utf-8-sig",newline="") as f:
@@ -30,7 +47,8 @@ def run_tool(tool,args,folder,approve):
             return json.dumps({"columns":rdr.fieldnames,"rows":len(rows),"sample":rows[:5]},ensure_ascii=False)
     if tool=="save_text":
         if path.suffix.lower() not in (".txt",".md",".json",".csv"):raise ValueError("Estensione non consentita")
-        content=str(args.get("content",""))[:200000]
+        content=str(args.get("content",""))
+        if len(content)>200000:raise ValueError("Output troppo grande")
         if not approve("Scrivere",str(path),content[:500]):return "RIFIUTATO"
         path.parent.mkdir(parents=True,exist_ok=True)
         if path.exists():shutil.copy2(path,str(path)+".bak")
@@ -51,20 +69,32 @@ def run_tool(tool,args,folder,approve):
         path.write_text(data.replace(old,new,1),encoding="utf-8")
         return "MODIFICATO"
     raise ValueError("Strumento non valido")
-def execute(goal,app,folder,model_fn,approve,log):
+def execute(goal,app,folder,model_fn,approve,log,stopped=lambda:False,specialty=''):
     allowed=tools(app)
     system=("Sei un agente PolarLabs. Restituisci ESCLUSIVAMENTE JSON nella forma "
       + '{"tool":"nome","args":{}}'+". Un passo alla volta. Strumenti: "+", ".join(allowed)
-      +". Schemi: list_files {path}; read_text {path}; search_text {path,query}; csv_summary {path}; "
+      +". Schemi: list_files {path}; read_text {path}; search_text {path,query}; csv_summary {path}; read_pdf {path}; read_docx {path}; "
       +"save_text {path,content}; move_file {path,destination}; replace_text {path,find,replace}; finish {answer}. "
-      +"Usa percorsi relativi alla cartella indicata. Non inventare i risultati.")
+      +"Usa percorsi relativi alla cartella indicata. Non inventare i risultati. "
+      +"Specializzazione: "+specialty)
     history=[{"role":"system","content":system},{"role":"user","content":goal}]
     for index in range(MAX_STEPS):
+        if stopped():return 'Operazione interrotta dall utente.'
         result=model_fn(history).strip()
+        if stopped():return 'Operazione interrotta dall utente.'
         try:
-            action=json.loads(result)
-            if not isinstance(action,dict):raise ValueError("Not object")
-        except ValueError:
+            candidate=result
+            if candidate.startswith(chr(96)*3):
+                candidate=candidate.split("\n",1)[-1]
+                candidate=candidate.rsplit(chr(96)*3,1)[0].strip()
+            try:
+                action=json.loads(candidate)
+            except ValueError:
+                start=candidate.find("{")
+                action=json.JSONDecoder().raw_decode(candidate[start:])[0] if start>=0 else None
+            if not isinstance(action,dict):
+                raise ValueError("Not an object")
+        except (ValueError,TypeError):
             action={"tool":"finish","args":{"answer":result}}
         name=action.get("tool","finish");args=action.get("args",{})
         if not isinstance(args,dict):args={}
